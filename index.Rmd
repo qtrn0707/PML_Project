@@ -1,0 +1,233 @@
+---
+title: "Predicting Barbell Lifts from Accelerometer Data"
+author: "qtrn0707"
+date: "July 24, 2017"
+output: html_document
+---
+
+
+## Load, Clean and Split the Data
+
+### Load the Data
+```{r}
+validation <- read.csv("pml-testing.csv"); building <- read.csv("pml-training.csv")
+```
+
+### Clean the Data
+
+Some rows of the *building* dataset contains summary statistics for the preceding rows (*new_window* == *yes*). These rows are excluded from the analysis. The columns containing summary statistics (those with names that start with *kurtosis*, *skewness*, *max*, *min*, *amplitude*, *var*, *avg*, *stddev*) are also excluded.
+```{r}
+building <- building[building$new_window != "yes",]
+validation <- validation[validation$new_window != "yes",]
+
+removable <- function(name) {
+        prefixes <- c("kurtosis", "skewness", "max", "min", "amplitude", "var", "avg", "stddev")
+        any(startsWith(name, prefixes))    
+}
+
+removableIndices <- sapply(names(building), removable)
+building <- building[,!removableIndices]; validation <- validation[,!removableIndices]
+```
+
+There are some variables that are irrelevant to the analysis:
+
+- *X* (column index = 1): the row index
+
+- *user_name* (column index = 2): name of the person which the observation was generated from
+
+- *raw_timestamp_part_1*, *raw_timestamp_part_2*, *ctvd_timestamp* (column index = 3, 4, 5): the time stamps
+
+- *new_window* (column index = 6): indicates whether the row is a summary row or not
+
+- *num_window* (column index = 7): the numerical index of the time window when the data was generated.
+
+These variables are also excluded:
+```{r}
+building <- building[,-(1:7)]
+validation <- validation[,-(1:7)]
+```
+
+### Create the Training and Test Sets
+```{r, message=F}
+library(caret); set.seed(1221)
+
+inTrain <- createDataPartition(building$classe, p=0.7, list=F)
+training <- building[inTrain,]; testing <- building[-inTrain,]
+
+dim(training); dim(testing)
+```
+
+### Summarizing the Training Set
+```{r}
+table(sapply(training, class))
+summary(training$classe)
+```
+
+
+## Models
+
+### Notes
+
+This is a classification problem with 5 levels so generalized linear model (method="glm") will not be implemented.
+
+The cross-validation scheme is 10-fold cross-validation. Cross-validation is chosen over bootstrapping because it requires less computational time. In a problem with a large sample size like this, 10-fold cross-validation bias will be small.
+```{r, message=FALSE}
+tenFoldCV <- trainControl(method = "cv", allowParallel = TRUE)
+```
+
+### Decision Tree
+
+```{r, message=F, cache=T}
+rpartModel <- train(classe ~ ., data=training, method="rpart", trControl=tenFoldCV)
+```
+
+```{r, message=F}
+library(rattle)
+fancyRpartPlot(rpartModel$finalModel)
+
+rpartPredTrain <- predict(rpartModel, training)
+confusionMatrix(rpartPredTrain, training$classe)$overall
+```
+
+### Decision Tree Bagging
+
+```{r startParallel, echo=F, results='hide', message=F}
+library(parallel); library(doParallel)
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+```
+
+```{r, message=F, cache=T}
+treebagModel <- train(classe ~ ., data=training, method="treebag", trControl=tenFoldCV)
+```
+
+```{r endParallel, echo=F, results='hide'}
+stopCluster(cluster)
+registerDoSEQ()
+```
+
+```{r}
+treebagPredTrain <- predict(treebagModel, training)
+treebagModel$results
+```
+
+### Random Forests
+
+```{r, ref.label="startParallel", echo=F, results='hide'}
+```
+
+```{r, message=F, cache=T}
+rfModel <- train(classe ~ ., data=training, method="rf", ntree=10, trControl=tenFoldCV)
+```
+
+```{r, ref.label="endParallel", echo=F, results='hide'}
+```
+
+```{r, message=F}
+rfPredTrain <- predict(rfModel, training)
+confusionMatrix(rfPredTrain, training$classe)$overall
+```
+
+### Gradient Boosting
+
+Because gradient boosting is too computationally expensive, we will not perform it.
+
+### Linear Discriminant Analysis
+```{r, message=F, cache=T}
+ldaModel <- train(classe ~ ., data=training, method="lda", trControl=tenFoldCV)
+ldaModel$results
+```
+
+### Combining Models
+
+Of the 4 models trained above, Decision Tree Bagging and Random Forests have very high in-sample accuracy, far higher than the other two. Here we combine these two models using a multinomial regression (method="multinom").
+
+```{r, message=F, cache=T}
+predTrainDF <- data.frame(treebag = treebagPredTrain, rf = rfPredTrain, classe = training$classe)
+
+## Proportion of predictions both methods agree on
+mean(predTrainDF$treebag == predTrainDF$rf)
+
+## Fit a multinom model that combines both predictors
+multinomModel <- train(classe ~ ., data=predTrainDF, method="multinom", trace=F, trControl=tenFoldCV)
+multinomPredTrain <- predict(multinomModel, predTrainDF)
+```
+
+```{r}
+## Compare accuracy of the two individual predictors and the combined predictors on the training set
+mean(treebagPredTrain == training$classe)
+mean(rfPredTrain == training$classe)
+mean(multinomPredTrain == training$classe)
+```
+
+
+## Test the Models on the Test Set
+```{r, message=F}
+## Decision Tree
+rpartPredTest <- predict(rpartModel, testing)
+confusionMatrix(rpartPredTest, testing$classe)$overall
+
+## Decision Tree Bagging
+treebagPredTest <- predict(treebagModel, testing)
+confusionMatrix(treebagPredTest, testing$classe)$overall
+
+## Random Forests
+rfPredTest <- predict(rfModel, testing)
+confusionMatrix(rfPredTest, testing$classe)$overall
+
+## Linear Discriminant Analysis
+ldaPredTest <- predict(ldaModel, testing)
+confusionMatrix(ldaPredTest, testing$classe)$overall
+
+## Combined Model
+predTestDF <- data.frame(treebag = treebagPredTest, rf = rfPredTest, classe = testing$classe)
+multinomPredTest <- predict(multinomModel, predTestDF)
+confusionMatrix(multinomPredTest, testing$classe)$overall
+```
+
+The most accurate model among the 5 is random forests. This will be chosen as our final prediction algorithm.
+
+The out of sample error rate is estimated using the accuracy of the random forests model on the test set.
+
+```{r}
+OSE <- as.numeric(1 - confusionMatrix(multinomPredTest, testing$classe)$overall[1])
+print(OSE)
+```
+
+So, our best estimate of the out-of-sample error rate is `r round(100*OSE, 2)`%.
+
+
+
+## Final Model
+
+The final model chosen is random forests built on the building set.
+
+```{r, ref.label="startParallel", echo=F, results='hide'}
+```
+
+```{r, message=F, cache=T}
+rfModelBuild <- train(classe ~ ., data=building, method="rf", ntree=10, trControl=tenFoldCV)
+```
+
+```{r, ref.label="endParallel", echo=F, results='hide'}
+```
+
+```{r, message=F, cache=T}
+rfPredBuild <- predict(rfModelBuild, building)
+
+ISE <- 1 - mean(rfPredBuild == building$classe); print(ISE)
+```
+
+The final in-sample error rate is `r 100*round(ISE, 2)`%, or `r round(ISE*nrow(building))` false classifications out of `r nrow(building)`.
+
+
+## Predict the Validation Set
+
+```{r}
+rfPredValidation <- predict(rfModelBuild, validation)
+```
+
+Our final predictions are:
+```{r}
+print(rfPredValidation)
+```
